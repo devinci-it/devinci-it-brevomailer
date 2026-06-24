@@ -4,174 +4,156 @@ declare(strict_types=1);
 
 namespace DevinciIT\BrevoMailer\Transports;
 
-use DevinciIT\BrevoMailer\Contracts\MailerInterface;
 use DevinciIT\BrevoMailer\Config\SmtpConfig;
+use DevinciIT\BrevoMailer\Contracts\MailerInterface;
 use DevinciIT\BrevoMailer\DTO\EmailMessage;
 use DevinciIT\BrevoMailer\DTO\EmailSender;
-use DevinciIT\BrevoMailer\Helpers\Sanitizer;
 use PHPMailer\PHPMailer\PHPMailer;
-use PHPMailer\PHPMailer\Exception;
-use RuntimeException;
+use PHPMailer\PHPMailer\Exception as PHPMailerException;
 
-/**
- * BrevoTransport
- * * Handles secure SMTP communication via PHPMailer, implementing the MailerInterface.
- * Integrates automatic, late-stage payload sanitization to prevent XSS and 
- * Email Header Injection attacks prior to network transmission.
- */
 class BrevoTransport implements MailerInterface
 {
-    /**
-     * Initializes the transport with the provided environment configuration.
-     */
-    public function __construct(private readonly SmtpConfig $config) {}
+    private PHPMailer $mail;
+
+    public function __construct(private readonly SmtpConfig $config)
+    {
+        $this->mail = new PHPMailer(true);
+
+        $this->mail->isSMTP();
+        $this->mail->Host       = $this->config->host;
+        $this->mail->SMTPAuth   = true;
+        $this->mail->Username   = $this->config->username;
+        $this->mail->Password   = $this->config->password;
+        $this->mail->SMTPSecure = $this->config->encryption;
+        $this->mail->Port       = $this->config->port;
+
+        $this->mail->isHTML($this->config->defaultIsHtml);
+    }
 
     /**
-     * Main Orchestrator: Single entry point for sending emails.
-     *
-     * @param EmailMessage $message The email payload.
-     * @param EmailSender|null $overrideSender Optional sender override.
-     * @return bool True on successful handoff to the SMTP relay.
-     * @throws RuntimeException If the SMTP transport fails or rejects the connection.
+     * Dispatches the email via PHPMailer.
      */
     public function send(EmailMessage $message, ?EmailSender $overrideSender = null): bool
     {
-        $mail = new PHPMailer(true);
-        
         try {
-            $this->configureServer($mail);
-            $this->setSender($mail, $overrideSender);
-            $this->setContent($mail, $message);
-            $this->addAttachments($mail, $message->attachments);
+            $this->mail->clearAllRecipients();
+            $this->mail->clearAttachments();
+            $this->mail->clearCustomHeaders();
 
-            return $mail->send();
-            
-        } catch (Exception $e) {
-            throw new RuntimeException("BrevoMailer Transport failed: {$mail->ErrorInfo}");
+            // Sender Override Logic
+            if ($overrideSender !== null) {
+                // Using getters/properties based on your DTO structure
+                $fromEmail = $overrideSender->email ?? $this->config->defaultFromEmail;
+                $fromName  = $overrideSender->name ?? $this->config->defaultFromName;
+                $this->mail->setFrom($fromEmail, $fromName);
+            } else {
+                $this->mail->setFrom($this->config->defaultFromEmail, $this->config->defaultFromName);
+            }
+
+            $this->mail->addAddress($message->to);
+            $this->mail->Subject = $message->subject;
+
+            // Smart Body Assignment
+            $html = $message->htmlBody ?? '';
+            $text = $message->textBody ?? '';
+
+            if (!empty($html)) {
+                $this->mail->isHTML(true);
+                $this->mail->Body = $html;
+                $this->mail->AltBody = !empty($text) ? $text : strip_tags($html);
+            } else {
+                $this->mail->isHTML(false);
+                $this->mail->Body = $text;
+            }
+
+            // Attachments
+            $attachments = $message->attachments ?? [];
+            if (!empty($attachments)) {
+                foreach ($attachments as $attachment) {
+                    if (is_string($attachment) && file_exists($attachment)) {
+                        $this->mail->addAttachment($attachment);
+                    }
+                }
+            }
+
+            $this->mail->send();
+            return true;
+        } catch (PHPMailerException $e) {
+            error_log("PHPMailer Transport Error: {$this->mail->ErrorInfo}");
+            throw new \RuntimeException("Mail transport failed: " . $e->getMessage(), 0, $e);
+        } catch (\Throwable $e) {
+            error_log("BrevoTransport Critical Error: " . $e->getMessage());
+            throw new \RuntimeException("Unexpected mailer error: " . $e->getMessage(), 0, $e);
         }
     }
 
     /**
-     * Bulk sender: Optimized for processing multiple messages sequentially.
+     * Sends a batch of messages efficiently by keeping the SMTP connection alive.
      *
-     * @param EmailMessage[] $messages Array of email payloads.
+     * @param EmailMessage[] $messages
      * @return int Number of successfully sent emails.
      */
     public function sendBulk(array $messages): int
     {
-        $sentCount = 0;
+        $successCount = 0;
+
+        // Optimize bulk sending by preventing PHPMailer from dropping the connection after each email
+        $this->mail->SMTPKeepAlive = true;
+
         foreach ($messages as $message) {
-            if ($this->send($message)) {
-                $sentCount++;
+            if (!$this->validate($message)) {
+                continue;
+            }
+
+            try {
+                if ($this->send($message)) {
+                    $successCount++;
+                }
+            } catch (\Throwable $e) {
+                // Log failure for this specific message but continue processing the queue
+                error_log("Bulk send failure for {$message->to}: " . $e->getMessage());
             }
         }
-        return $sentCount;
+
+        // Close the connection explicitly once the queue is finished
+        $this->mail->smtpClose();
+
+        return $successCount;
     }
 
     /**
-     * Pre-flight validation: Ensures the DTO contains essential data before initiating SMTP.
-     *
-     * @param EmailMessage $message The email payload to check.
-     * @return bool True if the message has a valid recipient and subject.
+     * Pre-flight validation to ensure the DTO has the minimum required data.
      */
     public function validate(EmailMessage $message): bool
     {
-        return !empty($message->to) && 
-               !empty($message->subject) && 
-               (filter_var($message->to, FILTER_VALIDATE_EMAIL) !== false);
+        if (empty($message->to) || !filter_var($message->to, FILTER_VALIDATE_EMAIL)) {
+            return false;
+        }
+
+        if (empty($message->subject)) {
+            return false;
+        }
+
+        if (empty($message->htmlBody) && empty($message->textBody)) {
+            return false;
+        }
+
+        return true;
     }
 
     /**
-     * Health check: Verifies SMTP connectivity without transmitting a payload.
-     * Useful for application status dashboards.
-     *
-     * @return bool True if the server is reachable and credentials are valid.
+     * Returns the transport status by attempting a silent connection to the SMTP server.
      */
     public function isHealthy(): bool
     {
-        $mail = new PHPMailer(true);
         try {
-            $this->configureServer($mail);
-            return (bool)$mail->smtpConnect();
-        } catch (\Exception $e) {
-            return false;
-        }
-    }
-
-    // --- Private Helper Methods (Compose Method Pattern) ---
-
-    /**
-     * Configures the PHPMailer instance with the SMTP credentials and encryption protocols.
-     */
-    private function configureServer(PHPMailer $mail): void
-    {
-        $mail->isSMTP();
-        $mail->Host       = $this->config->host;
-        $mail->SMTPAuth   = true;
-        $mail->Username   = $this->config->username;
-        $mail->Password   = $this->config->password;
-        $mail->Port       = $this->config->port;
-        $mail->CharSet    = 'UTF-8';
-        
-        $mail->SMTPSecure = strtolower($this->config->encryption) === 'ssl' 
-                            ? PHPMailer::ENCRYPTION_SMTPS 
-                            : PHPMailer::ENCRYPTION_STARTTLS;
-    }
-
-    /**
-     * Applies the sender details, using the override if provided, otherwise falling back to config defaults.
-     */
-    private function setSender(PHPMailer $mail, ?EmailSender $override): void
-    {
-        $senderEmail = $override ? $override->email : $this->config->defaultFromEmail;
-        $senderName  = $override ? $override->name  : $this->config->defaultFromName;
-
-        // Note: We do not strictly sanitize from emails here as they originate from your controlled .env file
-        $mail->setFrom($senderEmail, $senderName);
-    }
-
-    /**
-     * Applies the recipient, subject, and body content to the mailer.
-     * STRICT SANITIZATION is enforced here before data touches the PHPMailer object.
-     */
-    private function setContent(PHPMailer $mail, EmailMessage $message): void
-    {
-        // Prevent Header Injection attacks
-        $mail->addAddress(Sanitizer::emailHeader($message->to));
-        
-        // Strip all tags from the subject line
-        $mail->Subject = Sanitizer::plainText($message->subject);
-        
-        if (!empty($message->htmlBody)) {
-            $mail->isHTML(true);
-            
-            // Purify HTML content to prevent XSS
-            $mail->Body = Sanitizer::safeHtml($message->htmlBody);
-            
-            // Sanitize explicit textBody if provided, otherwise strip tags from the purified HTML
-            $mail->AltBody = $message->textBody 
-                             ? Sanitizer::plainText($message->textBody) 
-                             : strip_tags($mail->Body);
-        } else {
-            $mail->isHTML(false);
-            
-            // Fallback to strict plain text if no HTML is present
-            $mail->Body = $message->textBody ? Sanitizer::plainText($message->textBody) : '';
-        }
-    }
-
-    /**
-     * Iterates through the provided file paths and attaches them if they exist on the disk.
-     * Skips missing files to prevent execution halts.
-     */
-    private function addAttachments(PHPMailer $mail, array $attachments): void
-    {
-        foreach ($attachments as $path) {
-            if (file_exists($path)) {
-                $mail->addAttachment($path);
-            } else {
-                error_log("BrevoMailer Warning: Attachment skipped - File not found at {$path}");
+            $isConnected = $this->mail->smtpConnect();
+            if ($isConnected) {
+                $this->mail->smtpClose();
             }
+            return $isConnected;
+        } catch (\Throwable $e) {
+            return false;
         }
     }
 }
