@@ -6,6 +6,7 @@ namespace DevinciIT\BrevoMailer\Transports;
 
 use DevinciIT\BrevoMailer\Config\SmtpConfig;
 use DevinciIT\BrevoMailer\Contracts\MailerInterface;
+use DevinciIT\BrevoMailer\DTO\Attachment;
 use DevinciIT\BrevoMailer\DTO\EmailMessage;
 use DevinciIT\BrevoMailer\DTO\EmailSender;
 use PHPMailer\PHPMailer\PHPMailer;
@@ -42,7 +43,6 @@ class BrevoTransport implements MailerInterface
 
             // Sender Override Logic
             if ($overrideSender !== null) {
-                // Using getters/properties based on your DTO structure
                 $fromEmail = $overrideSender->email ?? $this->config->defaultFromEmail;
                 $fromName  = $overrideSender->name ?? $this->config->defaultFromName;
                 $this->mail->setFrom($fromEmail, $fromName);
@@ -66,13 +66,18 @@ class BrevoTransport implements MailerInterface
                 $this->mail->Body = $text;
             }
 
-            // Attachments
-            $attachments = $message->attachments ?? [];
-            if (!empty($attachments)) {
-                foreach ($attachments as $attachment) {
-                    if (is_string($attachment) && file_exists($attachment)) {
-                        $this->mail->addAttachment($attachment);
-                    }
+            // Attachments — supports typed Attachment DTOs (raw bytes) and,
+            // for back-compat, plain string file paths.
+            foreach ($message->attachments as $attachment) {
+                if ($attachment instanceof Attachment) {
+                    $this->mail->addStringAttachment(
+                        $attachment->content,
+                        $attachment->filename,
+                        PHPMailer::ENCODING_BASE64,
+                        $attachment->contentType,
+                    );
+                } elseif (is_string($attachment) && file_exists($attachment)) {
+                    $this->mail->addAttachment($attachment);
                 }
             }
 
@@ -110,7 +115,6 @@ class BrevoTransport implements MailerInterface
                     $successCount++;
                 }
             } catch (\Throwable $e) {
-                // Log failure for this specific message but continue processing the queue
                 error_log("Bulk send failure for {$message->to}: " . $e->getMessage());
             }
         }
